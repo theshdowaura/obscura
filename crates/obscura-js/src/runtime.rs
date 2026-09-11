@@ -818,6 +818,10 @@ impl ObscuraJsRuntime {
         frame.cookie_jar = parent.cookie_jar.clone();
         frame.http_client = parent.http_client.clone();
         frame.callbacks = parent.callbacks.clone();
+        #[cfg(feature = "render")]
+        if frame.callbacks.as_ref().is_some_and(|callbacks| callbacks.has_interceptor()) {
+            frame.render_resources.set_sync_loading_enabled(false);
+        }
         frame.encoding = parent.encoding.clone();
         frame.blocked_urls = parent.blocked_urls.clone();
         frame.intercept_enabled = parent.intercept_enabled;
@@ -1028,7 +1032,14 @@ impl ObscuraJsRuntime {
     /// Install the owning page's passive on_request/on_response callback
     /// registry so scripted fetch()/XHR observation is page-scoped (issue #408).
     pub fn set_callbacks(&self, callbacks: std::sync::Arc<obscura_net::CallbackRegistry>) {
-        self.state.borrow_mut().callbacks = Some(callbacks);
+        let mut state = self.state.borrow_mut();
+        #[cfg(feature = "render")]
+        if callbacks.has_interceptor() {
+            // Geometry and font measurement must not use the synchronous ureq
+            // fallback, which cannot pause for the page controller.
+            state.render_resources.set_sync_loading_enabled(false);
+        }
+        state.callbacks = Some(callbacks);
     }
 
     /// Install the stealth (wreq) HTTP client so scripted fetch()/XHR is routed

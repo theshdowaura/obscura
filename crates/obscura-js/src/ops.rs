@@ -51,6 +51,9 @@ pub enum InterceptResolution {
 }
 
 pub struct InterceptedRequest {
+    /// Explicit owner for a page-scoped request-stage guard.
+    pub session_id: Option<String>,
+    pub frame_id: Option<String>,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -2211,6 +2214,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     // into an XHR `error`/`loadend`. 30s matches the other clients in the
     // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
     let mut builder = reqwest::Client::builder()
+                .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
@@ -2297,6 +2301,28 @@ fn cors_response_allows(
         allowed_origin == page_origin && allow_credentials == "true"
     } else {
         allowed_origin == "*" || allowed_origin == page_origin
+    }
+}
+
+/// Request-stage policy shared with navigation and static resources. Never
+/// treat an unavailable guard or an unsupported resolution as permission.
+async fn guard_script_request(
+    callbacks: Option<&CallbackRegistry>,
+    url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), deno_error::JsErrorBox> {
+    let Some(callbacks) = callbacks else { return Ok(()); };
+    if !callbacks.has_interceptor() { return Ok(()); }
+    let info = RequestInfo {
+        url: url::Url::parse(url).map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?,
+        method: method.to_string(),
+        headers: headers.clone(),
+        resource_type: ResourceType::Fetch,
+    };
+    match callbacks.intercept(&info).await {
+        obscura_net::interceptor::InterceptAction::Continue => Ok(()),
+        _ => Err(deno_error::JsErrorBox::generic("Request-stage guard blocked request")),
     }
 }
 
@@ -2412,6 +2438,8 @@ async fn op_fetch_url(
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            session_id: None,
+            frame_id: None,
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
@@ -2512,8 +2540,17 @@ async fn op_fetch_url(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
+    let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    if let Some(client) = &http_client {
+        if callbacks.as_ref().is_some_and(|c| c.has_interceptor()) {
+            custom_headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+        }
+        if !custom_headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+            custom_headers.insert("user-agent".into(), client.user_agent.read().await.clone());
+        }
+    }
+
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -2540,22 +2577,26 @@ async fn op_fetch_url(
             && req_method != reqwest::Method::POST
             || custom_headers.keys().any(|k| {
                 let kl = k.to_lowercase();
-                kl != "accept"
+                kl != "user-agent"
+                    && kl != "accept"
                     && kl != "accept-language"
                     && kl != "content-language"
                     && kl != "content-type"
             }));
 
     if needs_preflight {
+        guard_script_request(callbacks.as_deref(), &url, "OPTIONS", &custom_headers).await?;
         let preflight = client
             .request(reqwest::Method::OPTIONS, &url)
             .timeout(fetch_timeout())
             .header("Origin", &page_origin)
+            .header("User-Agent", custom_headers.get("user-agent").map(String::as_str).unwrap_or(""))
             .header("Access-Control-Request-Method", method.as_str())
             .header(
                 "Access-Control-Request-Headers",
                 custom_headers
                     .keys()
+                    .filter(|name| !name.eq_ignore_ascii_case("user-agent"))
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", "),
@@ -2624,6 +2665,7 @@ async fn op_fetch_url(
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
     let response = loop {
+        guard_script_request(callbacks.as_deref(), &current_url, current_method.as_str(), &custom_headers).await?;
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
@@ -2957,6 +2999,7 @@ async fn stealth_fetch_all(
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
+        guard_script_request(callbacks.as_deref(), &current_url, &current_method, &req_headers).await?;
         let r = stealth
             .send_single(
                 &current_method,

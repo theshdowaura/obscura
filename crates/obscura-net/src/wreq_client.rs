@@ -196,6 +196,7 @@ impl StealthHttpClient {
             .build();
 
         let mut builder = wreq::Client::builder()
+                .no_proxy()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
             // SSRF guard: reject hostnames that resolve to a private/loopback
@@ -287,6 +288,9 @@ impl StealthHttpClient {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
+            if callbacks.is_some_and(CallbackRegistry::has_interceptor) {
+                return Err(ObscuraNetError::Blocked(url.to_string()));
+            }
             return fetch_file_url(url, request.max_response_bytes).await;
         }
 
@@ -370,8 +374,11 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
-                .await
+            let resp = if callbacks.is_some_and(CallbackRegistry::has_interceptor) {
+                req.send().await
+            } else {
+                send_get_with_connection_reset_retry(req, &current_url).await
+            }
                 .map_err(|e| {
                     ObscuraNetError::Network(format!(
                         "{}: {} (source: {:?})",
@@ -515,6 +522,12 @@ impl StealthHttpClient {
             body: resp_body,
             redirected_from: Vec::new(),
         })
+    }
+
+    pub async fn set_user_agent(&self, user_agent: &str) {
+        let mut headers = self.extra_headers.write().await;
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+        headers.insert("user-agent".into(), user_agent.to_string());
     }
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
@@ -688,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");

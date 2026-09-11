@@ -937,26 +937,6 @@ pub fn emit_navigation_events(
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
 
-    if ctx.fetch_intercept.enabled {
-        for (i, net_event) in network_events.iter().enumerate() {
-            let rid = &nav_request_ids[i];
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
-    }
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];

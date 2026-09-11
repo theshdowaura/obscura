@@ -481,6 +481,12 @@ impl CallbackRegistry {
         self.interceptor.lock().unwrap().is_some()
     }
 
+    pub fn minimum_wait_timeout(&self) -> Duration {
+        self.interceptor.lock().unwrap().as_ref()
+            .map(|interceptor| interceptor.minimum_wait_timeout())
+            .unwrap_or(Duration::ZERO)
+    }
+
     pub async fn intercept(&self, info: &RequestInfo) -> InterceptAction {
         let interceptor = self.interceptor.lock().unwrap().clone();
         match interceptor {
@@ -1143,6 +1149,7 @@ impl ObscuraHttpClient {
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
+                .no_proxy()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
@@ -1456,6 +1463,9 @@ impl ObscuraHttpClient {
         validate_request_mode(&request, url)?;
 
         if url.scheme() == "file" {
+            if callbacks.is_some_and(CallbackRegistry::has_interceptor) {
+                return Err(ObscuraNetError::Blocked(url.to_string()));
+            }
             return fetch_file_url(url, request.max_response_bytes).await;
         }
 
@@ -1489,10 +1499,14 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
+            let mut request_headers = self.extra_headers.read().await.clone();
+            if !request_headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+                request_headers.insert("user-agent".into(), self.user_agent.read().await.clone());
+            }
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: request_headers,
                 resource_type: request.resource_type.clone(),
             };
 
@@ -2838,5 +2852,63 @@ mod cert_env_tests {
             None,
             Some(OsStr::new("/etc/ssl/certs"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod connect_time_guard_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ObservedResolver {
+        guard: SsrfGuardResolver,
+        lookups: Arc<AtomicU32>,
+        addresses: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    }
+    impl Resolve for ObservedResolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let future = self.guard.resolve(name);
+            let addresses = self.addresses.clone();
+            Box::pin(async move {
+                let checked: Vec<_> = future.await?.collect();
+                *addresses.lock().unwrap() = checked.clone();
+                Ok(Box::new(checked.into_iter()) as Addrs)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_dials_the_single_guarded_dns_result_without_second_lookup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let local = socket.local_addr().unwrap();
+            let mut buf = [0; 2048];
+            socket.read(&mut buf).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            local
+        });
+        let lookups = Arc::new(AtomicU32::new(0));
+        let addresses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Only this controlled loopback fixture opts in to private access.
+        let resolver = Arc::new(ObservedResolver { guard: SsrfGuardResolver::new(true), lookups: lookups.clone(), addresses: addresses.clone() });
+        let client = Client::builder().no_proxy().dns_resolver(resolver).build().unwrap();
+        let response = client.get(format!("http://localhost:{port}/")).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let destination = server.await.unwrap();
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        assert!(addresses.lock().unwrap().iter().any(|address| address.ip() == destination.ip()));
+    }
+
+    #[tokio::test]
+    async fn connection_time_dns_denies_localhost_before_socket_accept() {
+        assert!(!env_allows_private_network());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = Client::builder().no_proxy().dns_resolver(Arc::new(SsrfGuardResolver::new(false))).build().unwrap();
+        assert!(client.get(format!("http://localhost:{port}/")).send().await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
     }
 }

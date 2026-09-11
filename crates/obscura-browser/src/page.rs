@@ -2199,6 +2199,9 @@ impl Page {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(30_000);
+        let script_deadline_ms = script_deadline_ms.max(
+            self.callbacks.minimum_wait_timeout().as_millis() as u64,
+        );
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -3580,6 +3583,7 @@ impl Page {
         if max_ms == 0 || self.js.is_none() {
             return 0;
         }
+        let max_ms = max_ms.max(self.callbacks.minimum_wait_timeout().as_millis() as u64);
         let Some(document_url) = self.url.clone() else {
             return 0;
         };
@@ -4555,6 +4559,7 @@ impl Page {
         interceptor: Option<Arc<dyn obscura_net::interceptor::RequestInterceptor + Send + Sync>>,
     ) {
         self.callbacks.set_interceptor(interceptor);
+        if let Some(js) = &self.js { js.set_callbacks(self.callbacks.clone()); }
     }
 
     pub fn enable_intercept(&mut self, enabled: bool) {

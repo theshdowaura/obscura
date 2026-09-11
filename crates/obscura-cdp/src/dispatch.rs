@@ -328,6 +328,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.fetch_intercept.guarded_pages.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
