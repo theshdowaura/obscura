@@ -354,10 +354,12 @@ impl FloatContext {
             }
         };
 
-        // Short-circuit for zero-sized boxes
-        if floated_box.width == 0.0 || floated_box.height == 0.0 {
-            // TODO: need to update last_placed_float?
-
+        if start.is_none() {
+            start_y = start_y.max(self.segments.last().map(|seg| seg.y.end).unwrap_or(0.0));
+        }
+        let end_y = start_y + floated_box.height;
+        // Non-positive outer spans do not exclude content, including positive heights rounded away at this y.
+        if floated_box.width == 0.0 || !(end_y > start_y) {
             return PlacedFloatedBox {
                 width: floated_box.width,
                 height: floated_box.height,
@@ -373,11 +375,9 @@ impl FloatContext {
                 self.segments.push(Segment { y: last_y_end..start_y, insets: [0.0, 0.0] });
             }
 
-            let start_y = last_y_end.max(start_y);
-
             let mut insets = containing_block_insets;
             insets[slot] += floated_box.width;
-            self.segments.push(Segment { y: start_y..(start_y + floated_box.height), insets });
+            self.segments.push(Segment { y: start_y..end_y, insets });
 
             return PlacedFloatedBox {
                 width: floated_box.width,
@@ -410,7 +410,6 @@ impl FloatContext {
                 self.segments.len() - 1
             }
             Some(end_idx) => {
-                let end_y = start_y + floated_box.height;
                 if end_y != self.segments[end_idx].y.end {
                     self.subdivide_segment(end_idx, end_y);
                 }
@@ -547,6 +546,37 @@ mod tests {
 
     fn place(context: &mut FloatContext, width: f32, height: f32, direction: FloatDirection) {
         place_at(context, width, height, 0.0, direction);
+    }
+
+    #[test]
+    fn non_positive_representable_spans_preserve_geometry_without_reserving_space() {
+        for direction in [FloatDirection::Left, FloatDirection::Right] {
+            for available_width in [10.0, 100.0] {
+                for (min_y, height) in [(0.0, -10.0), (0.0, 0.0), (99.0, 0.000001)] {
+                    let mut context = FloatContext::new();
+                    context.set_width(available_width);
+                    place_at(&mut context, 10.0, 100.0, min_y, direction);
+                    let segments = context.segments.clone();
+
+                    let position = place_at(&mut context, 10.0, height, min_y, direction);
+                    let floated = match direction {
+                        FloatDirection::Left => context.left_floats.last().unwrap(),
+                        FloatDirection::Right => context.right_floats.last().unwrap(),
+                    };
+                    assert_eq!(floated.height, height);
+                    assert_eq!(floated.y, position.y);
+                    assert_eq!(context.segments.len(), segments.len());
+                    for (actual, expected) in context.segments.iter().zip(&segments) {
+                        assert_eq!(actual.y, expected.y);
+                        assert_eq!(actual.insets, expected.insets);
+                    }
+
+                    let normal = place_at(&mut context, 10.0, 5.0, min_y, direction);
+                    assert_eq!(normal.y, if available_width == 10.0 { min_y + 100.0 } else { min_y });
+                    assert!(context.segments.iter().all(|segment| segment.y.end > segment.y.start));
+                }
+            }
+        }
     }
 
     #[test]

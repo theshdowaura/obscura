@@ -355,6 +355,13 @@ impl StealthHttpClient {
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type,
             };
+            if let Some(callbacks) = callbacks {
+                match callbacks.intercept(&request_info).await {
+                    crate::interceptor::InterceptAction::Continue => {}
+                    crate::interceptor::InterceptAction::Fulfill(response) => return Ok(response),
+                    _ => return Err(ObscuraNetError::Blocked(current_url.to_string())),
+                }
+            }
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     callbacks.fire_request(&request_info).await;

@@ -452,6 +452,7 @@ pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 /// callback-free; page-driven fetches pass the page's registry in. Ids keep
 /// the `u64` shape #416 established on `Page::on_request`/`on_response`.
 pub struct CallbackRegistry {
+    interceptor: std::sync::Mutex<Option<Arc<dyn RequestInterceptor + Send + Sync>>>,
     on_request: RwLock<Vec<(u64, RequestCallback)>>,
     on_response: RwLock<Vec<(u64, ResponseCallback)>>,
     id_counter: std::sync::atomic::AtomicU64,
@@ -460,6 +461,7 @@ pub struct CallbackRegistry {
 impl CallbackRegistry {
     pub fn new() -> Self {
         CallbackRegistry {
+            interceptor: std::sync::Mutex::new(None),
             on_request: RwLock::new(Vec::new()),
             on_response: RwLock::new(Vec::new()),
             id_counter: std::sync::atomic::AtomicU64::new(1),
@@ -469,6 +471,22 @@ impl CallbackRegistry {
     fn next_id(&self) -> u64 {
         self.id_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_interceptor(&self, interceptor: Option<Arc<dyn RequestInterceptor + Send + Sync>>) {
+        *self.interceptor.lock().unwrap() = interceptor;
+    }
+
+    pub fn has_interceptor(&self) -> bool {
+        self.interceptor.lock().unwrap().is_some()
+    }
+
+    pub async fn intercept(&self, info: &RequestInfo) -> InterceptAction {
+        let interceptor = self.interceptor.lock().unwrap().clone();
+        match interceptor {
+            Some(interceptor) => interceptor.intercept(info).await,
+            None => InterceptAction::Continue,
+        }
     }
 
     /// Register a request callback; the returned id detaches it via
@@ -1284,6 +1302,12 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
+        // A shared cache hit must not bypass this page's request policy.
+        if callbacks.is_some_and(CallbackRegistry::has_interceptor) {
+            return self
+                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .await;
+        }
         let Some(cache_key) = self
             .resource_cache_key(&initial_method, url, &initial_body, &request)
             .await
@@ -1471,6 +1495,14 @@ impl ObscuraHttpClient {
                 headers: self.extra_headers.read().await.clone(),
                 resource_type: request.resource_type.clone(),
             };
+
+            if let Some(callbacks) = callbacks {
+                match callbacks.intercept(&request_info).await {
+                    InterceptAction::Continue => {}
+                    InterceptAction::Fulfill(response) => return Ok(response),
+                    _ => return Err(ObscuraNetError::Blocked(current_url.to_string())),
+                }
+            }
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
                 match interceptor.intercept(&request_info).await {

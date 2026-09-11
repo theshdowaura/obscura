@@ -4550,6 +4550,13 @@ impl Page {
         }
     }
 
+    pub fn set_request_interceptor(
+        &self,
+        interceptor: Option<Arc<dyn obscura_net::interceptor::RequestInterceptor + Send + Sync>>,
+    ) {
+        self.callbacks.set_interceptor(interceptor);
+    }
+
     pub fn enable_intercept(&mut self, enabled: bool) {
         self.intercept_enabled = enabled;
         if let Some(js) = &self.js {

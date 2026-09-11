@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Floats with non-positive representable outer spans</title>
+<style>
+  body { margin: 16px; font: 16px sans-serif; }
+  .case { overflow: hidden; width: 100px; margin-bottom: 16px; background: #eee; }
+  .anchor { float: left; width: 10px; height: 100px; background: #4682b4; }
+  .probe { float: left; width: 10px; height: 10px; background: #e06040; }
+  #negative { margin-bottom: -20px; }
+  #tiny-case { padding-top: 99px; }
+  #tiny { height: 0.000001px; }
+</style>
+<div class="case"><div class="anchor"></div><div class="probe" id="negative"></div></div>
+<div class="case" id="tiny-case"><div class="anchor"></div><div class="probe" id="tiny"></div></div>
+<div class="case"><div class="anchor"></div><div class="probe" id="normal"></div></div>
+<script>
+  function checkFloatSpans() {
+    const cases = ['negative', 'tiny', 'normal'].map(id => {
+      const node = document.getElementById(id);
+      const style = getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      const anchor = node.previousElementSibling.getBoundingClientRect();
+      return {
+        id, width: rect.width, height: rect.height, marginBottom: style.marginBottom,
+        aligned: rect.y === anchor.y && rect.x === anchor.right,
+      };
+    });
+    return {
+      passed: cases.every(item => item.aligned && item.width === 10)
+        && cases[0].height === 10 && cases[0].marginBottom === '-20px'
+        && cases[1].height === 0 && cases[2].height === 10,
+      cases,
+    };
+  }
+</script>

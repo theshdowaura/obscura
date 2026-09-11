@@ -5133,6 +5133,9 @@ fn parse_color_for_scheme(value: &str, dark_scheme: bool) -> Option<[u8; 4]> {
 
     let v = value.split_whitespace().next()?.to_ascii_lowercase();
     if let Some(h) = v.strip_prefix('#') {
+        if !h.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
         let (r, g, b, a) = match h.len() {
             3 => (
                 u8::from_str_radix(&h[0..1].repeat(2), 16).ok()?,
@@ -10325,6 +10328,21 @@ mod tests {
         assert!(!n.background_clip_text);
         let l = compute_style("h1", Some("background-clip: text"));
         assert!(l.background_clip_text);
+    }
+
+    #[test]
+    fn hex_colors_reject_non_ascii_and_preserve_valid_lengths() {
+        for malformed in ["#；", "#；0", "#000；", "#00000；", "#ggg", "#+1+2+3"] {
+            assert_eq!(parse_color(malformed), None, "{malformed}");
+        }
+        for (value, rgba) in [
+            ("#AbC", [170, 187, 204, 255]),
+            ("#AbCd", [170, 187, 204, 221]),
+            ("#AbCdEf", [171, 205, 239, 255]),
+            ("#AbCdEf80", [171, 205, 239, 128]),
+        ] {
+            assert_eq!(parse_color(value), Some(rgba), "{value}");
+        }
     }
 
     #[test]
